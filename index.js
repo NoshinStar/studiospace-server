@@ -89,6 +89,7 @@ function pickStudioFields(body) {
     location: body.location?.trim(),
     image: body.image?.trim(),
     amenities: Array.isArray(body.amenities) ? body.amenities : [],
+    gallery: Array.isArray(body.gallery) ? body.gallery.filter(Boolean) : undefined,
     overview: body.overview?.trim(),
   };
 
