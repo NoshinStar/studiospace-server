@@ -345,6 +345,198 @@ app.delete("/api/studios/:id", async (req, res) => {
   }
 });
 
+
+// ======================================
+// BOOKING API
+// ======================================
+
+// Booking collection
+const bookingsCol = async () =>
+  (await connectDB()).collection("bookings");
+
+// Convert HH:MM time into minutes
+const toMinutes = (hhmm) => {
+  const m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(hhmm || "");
+  return m ? Number(m[1]) * 60 + Number(m[2]) : null;
+};
+
+// Convert minutes back into HH:MM
+const toHHMM = (min) =>
+  `${String(Math.floor(min / 60)).padStart(2, "0")}:${String(min % 60).padStart(2, "0")}`;
+
+// POST - Create a booking
+app.post("/api/bookings", async (req, res) => {
+  try {
+    const { studioId, date, startTime, hours, userEmail, userName } = req.body;
+
+    if (!isValidId(studioId)) {
+      return res.status(400).json({ message: "Invalid studio." });
+    }
+
+    if (!userEmail) {
+      return res.status(400).json({ message: "Please log in to book." });
+    }
+
+    if (
+      !/^\d{4}-\d{2}-\d{2}$/.test(date || "") ||
+      Number.isNaN(Date.parse(date)) ||
+      new Date(date).toISOString().slice(0, 10) !== date
+    ) {
+      return res.status(400).json({ message: "Choose a valid date." });
+    }
+
+    const startMin = toMinutes(startTime);
+    const h = Number(hours);
+
+    if (startMin === null || !Number.isInteger(h) || h < 1 || h > 12) {
+      return res.status(400).json({
+        message: "Choose a valid start time and duration.",
+      });
+    }
+
+    const endMin = startMin + h * 60;
+
+    if (endMin > 24 * 60) {
+      return res.status(400).json({
+        message: "A booking must end by midnight.",
+      });
+    }
+
+    const today = new Date();
+    today.setUTCHours(0, 0, 0, 0);
+
+    if (new Date(`${date}T00:00:00.000Z`) < today) {
+      return res.status(400).json({
+        message: "The date can't be in the past.",
+      });
+    }
+
+    const studio = await (await studiosCol()).findOne({
+      _id: new ObjectId(studioId),
+    });
+
+    if (!studio) {
+      return res.status(404).json({ message: "Studio not found." });
+    }
+
+    if (studio.ownerEmail === userEmail) {
+      return res.status(400).json({
+        message: "You can't book your own studio.",
+      });
+    }
+
+    const doc = {
+      studioId: studio._id.toString(),
+      studioTitle: studio.title,
+      studioImage: studio.image,
+      studioLocation: studio.location,
+      ownerEmail: studio.ownerEmail,
+      hourlyRate: studio.hourlyRate,
+      securityDeposit: studio.securityDeposit ?? 0,
+      date,
+      startTime: toHHMM(startMin),
+      endTime: toHHMM(endMin),
+      startMinutes: startMin,
+      endMinutes: endMin,
+      hours: h,
+      totalPrice: studio.hourlyRate * h,
+      userEmail,
+      userName: userName || "Creator",
+      status: "Pending",
+      createdAt: new Date(),
+    };
+
+    const result = await (await bookingsCol()).insertOne(doc);
+
+    res.status(201).json({ insertedId: result.insertedId });
+  } catch (error) {
+    console.error("Create booking error:", error);
+
+    res.status(500).json({
+      message: "Failed to create the booking.",
+    });
+  }
+});
+
+
+ // GET - Load bookings for a user
+app.get("/api/my-bookings", async (req, res) => {
+  try {
+    const { email } = req.query;
+
+    if (!email) {
+      return res.status(400).json({
+        message: "Email is required.",
+      });
+    }
+
+    const list = await (await bookingsCol())
+      .find({ userEmail: email })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.json(list);
+  } catch (error) {
+    console.error("Get my bookings error:", error);
+
+    res.status(500).json({
+      message: "Failed to load your bookings.",
+    });
+  }
+});
+
+
+
+ // PATCH - Cancel a pending booking
+app.patch("/api/bookings/:id/cancel", async (req, res) => {
+  try {
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({
+        message: "Invalid booking id.",
+      });
+    }
+
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({
+        message: "Email is required.",
+      });
+    }
+
+    const result = await (await bookingsCol()).updateOne(
+      {
+        _id: new ObjectId(req.params.id),
+        userEmail: email,
+        status: "Pending",
+      },
+      {
+        $set: {
+          status: "Cancelled",
+          cancelledAt: new Date(),
+        },
+      }
+    );
+
+    if (!result.matchedCount) {
+      return res.status(400).json({
+        message: "Only your pending bookings can be cancelled.",
+      });
+    }
+
+    res.json({
+      modifiedCount: result.modifiedCount,
+    });
+  } catch (error) {
+    console.error("Cancel booking error:", error);
+
+    res.status(500).json({
+      message: "Failed to cancel the booking.",
+    });
+  }
+});
+
+
 // ======================================
 // SERVER
 // ======================================
