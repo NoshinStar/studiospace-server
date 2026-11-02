@@ -1,4 +1,3 @@
-
 require("dotenv").config();
 
 const express = require("express");
@@ -364,6 +363,23 @@ const toMinutes = (hhmm) => {
 const toHHMM = (min) =>
   `${String(Math.floor(min / 60)).padStart(2, "0")}:${String(min % 60).padStart(2, "0")}`;
 
+// NEW: Find a confirmed booking that overlaps the requested time slot
+async function findConflict({ studioId, date, startMinutes, endMinutes, excludeId }) {
+  const query = {
+    studioId,
+    date,
+    status: "Confirmed",
+    startMinutes: { $lt: endMinutes },
+    endMinutes: { $gt: startMinutes },
+  };
+
+  if (excludeId) {
+    query._id = { $ne: new ObjectId(excludeId) };
+  }
+
+  return (await bookingsCol()).findOne(query);
+}
+
 // POST - Create a booking
 app.post("/api/bookings", async (req, res) => {
   try {
@@ -425,6 +441,20 @@ app.post("/api/bookings", async (req, res) => {
       });
     }
 
+    // NEW: reject if the slot overlaps a confirmed booking
+    const conflict = await findConflict({
+      studioId: studio._id.toString(),
+      date,
+      startMinutes: startMin,
+      endMinutes: endMin,
+    });
+
+    if (conflict) {
+      return res.status(409).json({
+        message: `This studio is already booked from ${conflict.startTime} to ${conflict.endTime} on ${date}. Please choose another time.`,
+      });
+    }
+
     const doc = {
       studioId: studio._id.toString(),
       studioTitle: studio.title,
@@ -459,7 +489,7 @@ app.post("/api/bookings", async (req, res) => {
 });
 
 
- // GET - Load bookings for a user
+// GET - Load bookings for a user
 app.get("/api/my-bookings", async (req, res) => {
   try {
     const { email } = req.query;
@@ -486,8 +516,7 @@ app.get("/api/my-bookings", async (req, res) => {
 });
 
 
-
- // PATCH - Cancel a pending booking
+// PATCH - Cancel a pending booking
 app.patch("/api/bookings/:id/cancel", async (req, res) => {
   try {
     if (!isValidId(req.params.id)) {
@@ -532,6 +561,115 @@ app.patch("/api/bookings/:id/cancel", async (req, res) => {
 
     res.status(500).json({
       message: "Failed to cancel the booking.",
+    });
+  }
+});
+
+
+// ======================================
+// HOST BOOKING REQUESTS (NEW)
+// ======================================
+
+// GET - Booking requests for studios owned by this host
+app.get("/api/host-bookings", async (req, res) => {
+  try {
+    const { email } = req.query;
+
+    if (!email) {
+      return res.status(400).json({
+        message: "Email is required.",
+      });
+    }
+
+    const list = await (await bookingsCol())
+      .find({ ownerEmail: email })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.json(list);
+  } catch (error) {
+    console.error("Get host bookings error:", error);
+
+    res.status(500).json({
+      message: "Failed to load booking requests.",
+    });
+  }
+});
+
+// PATCH - Host confirms, rejects or completes a booking
+app.patch("/api/bookings/:id/status", async (req, res) => {
+  try {
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({
+        message: "Invalid booking id.",
+      });
+    }
+
+    const { email, status } = req.body;
+
+    if (!email || !["Confirmed", "Cancelled", "Completed"].includes(status)) {
+      return res.status(400).json({
+        message: "Invalid request.",
+      });
+    }
+
+    const col = await bookingsCol();
+
+    const booking = await col.findOne({
+      _id: new ObjectId(req.params.id),
+    });
+
+    if (!booking) {
+      return res.status(404).json({
+        message: "Booking not found.",
+      });
+    }
+
+    if (booking.ownerEmail !== email) {
+      return res.status(403).json({
+        message: "Only the studio host can update this booking.",
+      });
+    }
+
+    const allowed = {
+      Pending: ["Confirmed", "Cancelled"],
+      Confirmed: ["Completed", "Cancelled"],
+    };
+
+    if (!allowed[booking.status]?.includes(status)) {
+      return res.status(400).json({
+        message: `A ${booking.status} booking can't be marked ${status}.`,
+      });
+    }
+
+    // Double-booking guard when confirming
+    if (status === "Confirmed") {
+      const conflict = await findConflict({
+        studioId: booking.studioId,
+        date: booking.date,
+        startMinutes: booking.startMinutes,
+        endMinutes: booking.endMinutes,
+        excludeId: req.params.id,
+      });
+
+      if (conflict) {
+        return res.status(409).json({
+          message: `Can't confirm: another booking is already confirmed from ${conflict.startTime} to ${conflict.endTime} on ${booking.date}.`,
+        });
+      }
+    }
+
+    await col.updateOne(
+      { _id: booking._id },
+      { $set: { status, updatedAt: new Date() } }
+    );
+
+    res.json({ status });
+  } catch (error) {
+    console.error("Update booking status error:", error);
+
+    res.status(500).json({
+      message: "Failed to update the booking.",
     });
   }
 });
