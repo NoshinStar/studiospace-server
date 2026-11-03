@@ -40,6 +40,46 @@ async function connectDB() {
   return db;
 }
 
+// ======================================
+// JWT AUTH (Challenge 1)
+// ======================================
+
+// Verifies the BetterAuth JWT using its public keys (JWKS).
+// Missing, invalid or expired token => 401 Unauthorized.
+let jwks;
+
+async function verifyToken(req, res, next) {
+  try {
+    const header = req.headers.authorization || "";
+    const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+
+    if (!token) {
+      return res.status(401).json({
+        message: "Unauthorized: missing token.",
+      });
+    }
+
+    const { createRemoteJWKSet, jwtVerify } = await import("jose");
+
+    jwks ??= createRemoteJWKSet(
+      new URL(`${process.env.AUTH_URL}/api/auth/jwks`)
+    );
+
+    const { payload } = await jwtVerify(token, jwks, {
+      issuer: process.env.AUTH_URL,
+    });
+
+    req.user = { email: payload.email, name: payload.name };
+    next();
+  } catch (error) {
+    console.error("JWT verify error:", error.message);
+
+    res.status(401).json({
+      message: "Unauthorized: invalid or expired token.",
+    });
+  }
+}
+
 // Home route
 app.get("/", (req, res) => {
   res.send("StudioSpace server is running");
@@ -103,7 +143,7 @@ function pickStudioFields(body) {
 
 const isValidId = (id) => ObjectId.isValid(id);
 
-// 1. GET all studios
+// 1. GET all studios (public)
 // Supports category, search, sort and limit
 app.get("/api/studios", async (req, res) => {
   try {
@@ -162,7 +202,7 @@ app.get("/api/studios", async (req, res) => {
   }
 });
 
-// 2. GET one studio by ID
+// 2. GET one studio by ID (public)
 app.get("/api/studios/:id", async (req, res) => {
   try {
     if (!isValidId(req.params.id)) {
@@ -192,9 +232,9 @@ app.get("/api/studios/:id", async (req, res) => {
 });
 
 // 3. GET my studio listings
-app.get("/api/my-studios", async (req, res) => {
+app.get("/api/my-studios", verifyToken, async (req, res) => {
   try {
-    const { email } = req.query;
+    const email = req.user.email;
 
     if (!email) {
       return res.status(400).json({
@@ -217,8 +257,8 @@ app.get("/api/my-studios", async (req, res) => {
   }
 });
 
-// 4. POST - Create a new studio
-app.post("/api/studios", async (req, res) => {
+// 4. POST - Create a new studio (JWT protected)
+app.post("/api/studios", verifyToken, async (req, res) => {
   try {
     const data = pickStudioFields(req.body);
 
@@ -241,18 +281,13 @@ app.post("/api/studios", async (req, res) => {
       });
     }
 
-    if (!req.body.ownerEmail) {
-      return res.status(400).json({
-        message: "Owner email is required.",
-      });
-    }
-
     const doc = {
       ...data,
       securityDeposit: data.securityDeposit ?? 0,
       maxCapacity: data.maxCapacity ?? 1,
-      ownerEmail: req.body.ownerEmail,
-      ownerName: req.body.ownerName || "Host",
+      // JWT: owner comes from the verified token, not from the request body
+      ownerEmail: req.user.email,
+      ownerName: req.user.name || "Host",
       rating: 0,
       reviews: [],
       createdAt: new Date(),
@@ -273,7 +308,7 @@ app.post("/api/studios", async (req, res) => {
 });
 
 // 5. PUT - Update a studio
-app.put("/api/studios/:id", async (req, res) => {
+app.put("/api/studios/:id", verifyToken, async (req, res) => {
   try {
     if (!isValidId(req.params.id)) {
       return res.status(400).json({
@@ -281,7 +316,23 @@ app.put("/api/studios/:id", async (req, res) => {
       });
     }
 
-    const data = pickStudioFields(req.body);
+    const col = await studiosCol();
+
+const studio = await col.findOne({
+  _id: new ObjectId(req.params.id),
+});
+
+if (!studio) {
+  return res.status(404).json({
+    message: "Studio not found.",
+  });
+}
+
+if (studio.ownerEmail !== req.user.email) {
+  return res.status(403).json({
+    message: "You can only update your own studios.",
+  });
+}
 
     const result = await (await studiosCol()).updateOne(
       {
@@ -313,8 +364,8 @@ app.put("/api/studios/:id", async (req, res) => {
   }
 });
 
-// 6. DELETE - Delete a studio
-app.delete("/api/studios/:id", async (req, res) => {
+// 6. DELETE - Delete a studio (JWT protected, owner only)
+app.delete("/api/studios/:id", verifyToken, async (req, res) => {
   try {
     if (!isValidId(req.params.id)) {
       return res.status(400).json({
@@ -322,15 +373,28 @@ app.delete("/api/studios/:id", async (req, res) => {
       });
     }
 
-    const result = await (await studiosCol()).deleteOne({
+    const col = await studiosCol();
+
+    const studio = await col.findOne({
       _id: new ObjectId(req.params.id),
     });
 
-    if (!result.deletedCount) {
+    if (!studio) {
       return res.status(404).json({
         message: "Studio not found.",
       });
     }
+
+    // JWT: only the owner can delete their own studio
+    if (studio.ownerEmail !== req.user.email) {
+      return res.status(403).json({
+        message: "You can only delete your own studios.",
+      });
+    }
+
+    const result = await col.deleteOne({
+      _id: new ObjectId(req.params.id),
+    });
 
     res.json({
       deletedCount: result.deletedCount,
@@ -363,7 +427,7 @@ const toMinutes = (hhmm) => {
 const toHHMM = (min) =>
   `${String(Math.floor(min / 60)).padStart(2, "0")}:${String(min % 60).padStart(2, "0")}`;
 
-// NEW: Find a confirmed booking that overlaps the requested time slot
+// Find a confirmed booking that overlaps the requested time slot
 async function findConflict({ studioId, date, startMinutes, endMinutes, excludeId }) {
   const query = {
     studioId,
@@ -380,17 +444,17 @@ async function findConflict({ studioId, date, startMinutes, endMinutes, excludeI
   return (await bookingsCol()).findOne(query);
 }
 
-// POST - Create a booking
-app.post("/api/bookings", async (req, res) => {
+// POST - Create a booking (JWT protected)
+app.post("/api/bookings", verifyToken, async (req, res) => {
   try {
-    const { studioId, date, startTime, hours, userEmail, userName } = req.body;
+    const { studioId, date, startTime, hours } = req.body;
+
+    // JWT: the guest identity comes from the verified token
+    const userEmail = req.user.email;
+    const userName = req.user.name;
 
     if (!isValidId(studioId)) {
       return res.status(400).json({ message: "Invalid studio." });
-    }
-
-    if (!userEmail) {
-      return res.status(400).json({ message: "Please log in to book." });
     }
 
     if (
@@ -441,7 +505,7 @@ app.post("/api/bookings", async (req, res) => {
       });
     }
 
-    // NEW: reject if the slot overlaps a confirmed booking
+    // Reject if the slot overlaps a confirmed booking
     const conflict = await findConflict({
       studioId: studio._id.toString(),
       date,
@@ -490,15 +554,9 @@ app.post("/api/bookings", async (req, res) => {
 
 
 // GET - Load bookings for a user
-app.get("/api/my-bookings", async (req, res) => {
+app.get("/api/my-bookings", verifyToken, async (req, res) => {
   try {
-    const { email } = req.query;
-
-    if (!email) {
-      return res.status(400).json({
-        message: "Email is required.",
-      });
-    }
+    const email = req.user.email;
 
     const list = await (await bookingsCol())
       .find({ userEmail: email })
@@ -517,7 +575,7 @@ app.get("/api/my-bookings", async (req, res) => {
 
 
 // PATCH - Cancel a pending booking
-app.patch("/api/bookings/:id/cancel", async (req, res) => {
+app.patch("/api/bookings/:id/cancel", verifyToken, async (req, res) => {
   try {
     if (!isValidId(req.params.id)) {
       return res.status(400).json({
@@ -525,7 +583,7 @@ app.patch("/api/bookings/:id/cancel", async (req, res) => {
       });
     }
 
-    const { email } = req.body;
+    const email = req.user.email;
 
     if (!email) {
       return res.status(400).json({
@@ -567,13 +625,13 @@ app.patch("/api/bookings/:id/cancel", async (req, res) => {
 
 
 // ======================================
-// HOST BOOKING REQUESTS (NEW)
+// HOST BOOKING REQUESTS
 // ======================================
 
 // GET - Booking requests for studios owned by this host
 app.get("/api/host-bookings", async (req, res) => {
   try {
-    const { email } = req.query;
+    const email = req.user.email;
 
     if (!email) {
       return res.status(400).json({
@@ -597,7 +655,7 @@ app.get("/api/host-bookings", async (req, res) => {
 });
 
 // PATCH - Host confirms, rejects or completes a booking
-app.patch("/api/bookings/:id/status", async (req, res) => {
+app.patch("/api/bookings/:id/status", verifyToken, async (req, res) => {
   try {
     if (!isValidId(req.params.id)) {
       return res.status(400).json({
@@ -605,7 +663,8 @@ app.patch("/api/bookings/:id/status", async (req, res) => {
       });
     }
 
-    const { email, status } = req.body;
+    const { status } = req.body;
+    const email = req.user.email;
 
     if (!email || !["Confirmed", "Cancelled", "Completed"].includes(status)) {
       return res.status(400).json({
