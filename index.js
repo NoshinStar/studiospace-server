@@ -178,6 +178,7 @@ app.get("/api/studios", async (req, res) => {
     };
 
     const col = await studiosCol();
+    const data = pickStudioFields(req.body);
 
     let cursor = col
       .find(query)
