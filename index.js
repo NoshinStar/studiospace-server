@@ -118,7 +118,7 @@ const toNum = (v) =>
   v === undefined || v === "" ? undefined : Number(v);
 
 // Only allow approved fields to be saved
-function pickStudioFields(body) {
+function pickStudioFields(body = {}) {
   const data = {
     title: body.title?.trim(),
     category: body.category,
@@ -178,7 +178,6 @@ app.get("/api/studios", async (req, res) => {
     };
 
     const col = await studiosCol();
-    const data = pickStudioFields(req.body);
 
     let cursor = col
       .find(query)
@@ -312,56 +311,31 @@ app.post("/api/studios", verifyToken, async (req, res) => {
 app.put("/api/studios/:id", verifyToken, async (req, res) => {
   try {
     if (!isValidId(req.params.id)) {
-      return res.status(400).json({
-        message: "Invalid studio id.",
-      });
+      return res.status(400).json({ message: "Invalid studio id." });
     }
 
     const col = await studiosCol();
+    const studio = await col.findOne({ _id: new ObjectId(req.params.id) });
 
-const studio = await col.findOne({
-  _id: new ObjectId(req.params.id),
-});
-
-if (!studio) {
-  return res.status(404).json({
-    message: "Studio not found.",
-  });
-}
-
-if (studio.ownerEmail !== req.user.email) {
-  return res.status(403).json({
-    message: "You can only update your own studios.",
-  });
-}
-
-    const result = await (await studiosCol()).updateOne(
-      {
-        _id: new ObjectId(req.params.id),
-      },
-      {
-        $set: {
-          ...data,
-          updatedAt: new Date(),
-        },
-      }
-    );
-
-    if (!result.matchedCount) {
-      return res.status(404).json({
-        message: "Studio not found.",
-      });
+    if (!studio) {
+      return res.status(404).json({ message: "Studio not found." });
     }
 
-    res.json({
-      modifiedCount: result.modifiedCount,
-    });
+    if (studio.ownerEmail !== req.user.email) {
+      return res.status(403).json({ message: "You can only update your own studios." });
+    }
+
+    const data = pickStudioFields(req.body);
+
+    const result = await col.updateOne(
+      { _id: studio._id },
+      { $set: { ...data, updatedAt: new Date() } }
+    );
+
+    res.json({ modifiedCount: result.modifiedCount });
   } catch (error) {
     console.error("Update studio error:", error);
-
-    res.status(500).json({
-      message: "Failed to update the studio.",
-    });
+    res.status(500).json({ message: "Failed to update the studio." });
   }
 });
 
@@ -630,7 +604,7 @@ app.patch("/api/bookings/:id/cancel", verifyToken, async (req, res) => {
 // ======================================
 
 // GET - Booking requests for studios owned by this host
-app.get("/api/host-bookings", async (req, res) => {
+app.get("/api/host-bookings", verifyToken, async (req, res) => {
   try {
     const email = req.user.email;
 
